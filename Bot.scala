@@ -1,4 +1,4 @@
-import JetBot.HandlerType
+import JetBot._
 import akka.actor._
 
 import scala.collection.mutable
@@ -9,82 +9,80 @@ case class User(id: String, name: String) {
 case class Token(id: String) {
 }
 
-case class Message(text: String, destination: User)
-case class TalkStarted()
-case class TalkEnded()
-case class ReceivedMessage(text: String)
+sealed trait Message
+case class TextMessage(text: String, destination: User) extends Message
+case class TalkStarted() extends Message
+case class TalkEnded() extends Message
+
+
+
 case class TestMessage(text: String, sender: User)
 
 package object JetBot {
-    type HandlerType = (Talk) => Actor.Receive
-}
+    type HandlerType = List[Action]
+    type Action = (TextMessage) => (Talk) => Any
+    type HandlersTableType = collection.mutable.Map[State, HandlerType]
 
-
-class Talk(user: User, StatesToHandlers : collection.mutable.Map[String, HandlerType]) extends Actor {
-
-    var currentState : String = "TalkStarted"
-
-    def say (text: String): Actor.Receive = {
-//        BotManager ! Message(text, user)
-        case _ =>
-            Console.println(text)
+    def say(text: String) : (Talk => Any) = {
+        (talk : Talk) => talk.say(text)
     }
 
-    def changeState (newState: String) = {
+    def moveTo(state: State) : (Talk => Any) = {
+        (talk : Talk) =>  talk.changeState(state)
+    }
+
+    implicit def stringToState(stateName: String) : State = {
+        State(stateName)
+    }
+}
+
+class Talk(user: User, StatesToHandlers : collection.mutable.Map[State, HandlerType]) extends Actor {
+
+    var currentState : State = State("TalkStarted")
+
+    def say (text: String): Unit = {
+//        BotManager ! Message(text, user)
+        Console.println(text)
+    }
+
+    def changeState (newState: State) = {
         currentState = newState
     }
 
     def receive = {
-        case TalkStarted =>
-            StatesToHandlers("TalkStarted")(this)
-        case TalkEnded =>
-            StatesToHandlers("TalkEnded")(this)
-        case msg =>
-            StatesToHandlers(currentState)(this)(msg)
+        case msg : TextMessage =>
+            StatesToHandlers(currentState).foreach(
+                (action : Action) => action(msg)(this)
+            )
     }
 }
 
 
-class StateDescriptionHelper(statesToHandlers: collection.mutable.Map[String, HandlerType],
-                             stateToAdd: String) {
-    private var nextState : String = ""
-    def use(handler: HandlerType) : StateDescriptionHelper = {
-        statesToHandlers(stateToAdd) = handler
-        this
-    }
-
-    def moving(nextState: String) : StateDescriptionHelper = {
-        this.nextState = nextState
-        this //TODO: think about proper implementation; see line 112 for details
+class StateHandlerChanger(statesToHandlers: HandlersTableType, changingState: State) {
+    def use (handler: HandlerType) = {
+        statesToHandlers(changingState) = handler
     }
 }
 
+case class State(stateName: String)
 
 class Bot(token: Token, name: String)(system: ActorSystem) {
     private val usersToTalks: collection.mutable.Map[User, ActorRef] = collection.mutable.Map()
-    val statesToHandlers: collection.mutable.Map[String, HandlerType] =
+    val statesToHandlers: collection.mutable.Map[State, HandlerType] =
         collection.mutable.Map(
-            ("TalkStarted", (talk: Talk) => sys.error("State handler not implemented!")),
-            ("TalkEnded", (talk: Talk) => sys.error("State handler not implemented!"))
+            (State("TalkStarted"), List ((msg : Message) => (talk: Talk) => sys.error("State handler not implemented!"))),
+            (State("TalkEnded"), List ( (msg : Message) => (talk: Talk) => sys.error("State handler not implemented!")))
         )
 
     val botActor = system.actorOf(BotActor.props(), name)
 
 
-    def say (text: String): HandlerType = {
-        (talk: Talk) => talk.say(text)
+    def addState(state: State) : Unit = {
+        statesToHandlers += state -> List((msg : Message) => (talk: Talk) => sys.error("Not implemented"))
     }
 
-    def goto (newState: String) : Unit = {
-        (talk: Talk) => talk.changeState(newState)
-    }
-
-    def addState(stateName: String) : Unit = {
-        statesToHandlers += stateName -> ((talk : Talk) => sys.error("Not implemented"))
-    }
-
-    def when(stateName: String) : StateDescriptionHelper = {
-        new StateDescriptionHelper(statesToHandlers, stateName)
+    def when(state: State) : StateHandlerChanger = {
+        new StateHandlerChanger(statesToHandlers, state)
     }
 
     object BotActor {
@@ -95,16 +93,17 @@ class Bot(token: Token, name: String)(system: ActorSystem) {
         def receive = {
             case TestMessage(text, sender) =>
                 usersToTalks.get(sender) match {
-                    case Some(talk) => talk ! ReceivedMessage(text)
+                    case Some(talk) => talk ! TextMessage(text, sender)
                     case None =>
                         val newTalk = context.actorOf(Props(classOf[Talk], sender, statesToHandlers), "talk-with-%s".format(sender.id))
                         usersToTalks += sender -> newTalk
-                        newTalk ! TalkStarted()
-                        newTalk ! ReceivedMessage(text)
+                        newTalk ! TextMessage("TalkStarted", sender)
+                        newTalk ! TextMessage(text, sender)
                 }
         }
     }
 }
+
 
 object main extends App {
     test()
@@ -113,63 +112,70 @@ object main extends App {
         implicit val system = ActorSystem("TestBot")
         val token = Token("Sometokentodo")
         val myBot = new Bot(token, "bot1")(system)
+
         myBot addState "Echoing"
-        myBot when "TalkStarted" use {
-            myBot say "Hello"
-        } movingTo
-        /* TODO: think about how implement this properly.
-         * Possible solutions:
-         * - Assume that we can call only one function per message recieved, and move between states only once too.
-         *   Then we can just add movingTo method to helper-object (but we have to invoke this move properly in Talk-actor)
-         * - Do not make such assumption; then we have to change implementation of handlers, so that handler could chain
-         *   many actions (i.e. say something, write to log, and then move to next state). Maybe something like
-         *   TransformerHelper class, which will return itself on call of transforming methods, so we could write like
-         *   "myBot say "Hello" writeToLog "said hello" moveTo "Echoing"
-         *   Note that this implementation restricts clients to use only pre-defined methods
-         * - Write some wrapper for custom functions that can invoke them one after one. Think about monads.
+
+        myBot when "TalkStarted" use List(
+            (message : TextMessage) => say("Hello, I'll echo everything you write until you say \"Good bye\""),
+            (message : TextMessage) => moveTo("Echoing")
+        )
+
+//        // works fine, cause it's easy
+//        myBot when "Echoing" use List(
+//            (message : TextMessage) => say(message.text)
+//        )
+
+//        // works incorrect
+//        myBot when "Echoing" use List(
+//            (message : TextMessage) =>
+//                if (message.text == "Goodbye") {
+//                    say("Goodbye, that was pleasure to echo with you :) ")
+//                    moveTo("TalkEnded")
+//                }
+//                else {
+//                    say(message.text)
+//                }
+//        )
+
+        // works correct, but has terrible syntax
+        myBot when "Echoing" use List (
+            (message : TextMessage) => if (message.text == "Goodbye")
+                    say("Goodbye, that was pleasure to echo with you :) ")
+                else
+                    say(message.text),
+            (message : TextMessage) =>
+                if (message.text == "Goodbye")
+                    moveTo("TalkEnded")
+                else
+                    moveTo("Echoing")
+
+        )
+
+        /* Проблемы, имеющиеся на данный момент:
+         * 1. Как красиво предоставлять пользователям доступ к сообщению?
+         * 2. Как предоставить возможность исполнять любую последовательность операторов?
+         * 3. Как убрать лишние синтаксические нагромождения типа List (...), скобочек и прочего
+         *
+         * Возможные решения:
+         * 1. Предоставить пользователям стого ограниченный набор функций, которые сами будут разруливать все что угодно.
+         *    Негибко!
+         * 2. Отделить переход между состояниями от вызова сайдэффекта. Cинтаксис типа:
+         *      when State moveTo State' yielding SideEffect
+         *    Будет велосипед FSM эрланга (и, как следствие, акки)
+         * 3. Сказать, чтобы пользователь сам писал PartialFunction[Any, Unit] в receive -- придется выдать ему
+         *    набор типовых сообщений, а дальше пусть он сам их разворачивает и че хочет вообще делает.
+         *
+         * Выглядит пока что так, что велосипед выигрывает (большое преимущество -- позволяем хранить некоторую информацию Data,
+         * и при этом абстрагируемся от деталей реализации класса)
          */
-
-
-        myBot when "TalkEnded" use {
-            myBot say "Goodbye"
-        }
+        myBot when "TalkEnded" use List(
+            (message : TextMessage) => say("Goodbye, that was pleasure to echo with you :) ")
+        )
 
         val sender = User("id123", "Boss")
-        myBot.botActor ! TestMessage("Hello", sender)
+        while(true) {
+            val messageToSend = io.StdIn.readLine()
+            myBot.botActor ! TestMessage(messageToSend, sender)
+        }
     }
 }
-
-//class Bot extends Actor {
-//    /* Вообще в акторе бота хочется наплодить много дочерних акторов, реализующих абстракцию беседы с
-//     * отдельным пользователем. Это выглядит всесторонне удобно - мы получаем бесплатную скалируемость ботов,
-//     * не задумываемся о параллельности, естественный персистенс отдельных бесед, и еще бог весть что.
-//     * В таком разе по сообщению хочется понимать, в какую беседу его перенаправить. Значит, каждый бот должен
-//     * хранить отображение Users -> Talks.
-//     *
-//     * Была мысль использоваться роутер, но он, видимо, решает немного другие задачи и не совсем подходит сюда, поэтому
-//     * решил взять обычный ассоциативный контейнер.
-//     */
-//    // TODO: используем immutable-map. Тогда приходится использовать var, чтобы менять его. Вроде это норм, но нужно уточнить
-//    // TODO: Подумать, как быть, если юзер присутствует в нескольких беседах?
-//    // TODO: Можно перписать на mutable-map!
-//    var UsersToTalks: Map[String, ActorRef] = Map()
-//
-//    // TODO: разобраться с props. Что это (конкретней, чем "рецепт для создания актора")? Почему такой синтаксис создания?
-//
-//    def receive = {
-//        case Message(text, userSender) =>
-//            // TODO: Что если юзер уже помер (и, как следствие, его нет в мапе), пока шло сообщение от сервера до нас?
-//            // TODO: Или, что намного хуже - если у нас ЕЩЕ НЕТ беседы с этим юзером, но сообщение StartTalk уже поехало, но еще не дошло? Но вроде так не бывает
-//            UsersToTalks.get(userSender) match {
-//                case Some(userTalk) => userTalk ! Message(text, userSender)
-//                case None =>
-//                    val newUserTalk = context.actorOf(Props[Talk], "talk-with-%s".format(userSender))
-//                    UsersToTalks = UsersToTalks + (userSender -> newUserTalk)
-//                    newUserTalk ! Message(text, userSender)
-//            }
-//
-//        case Terminated(child) =>
-//            val user_name = child.path.name.split("talk-with-", 1)(0) // TODO: ПЕРЕПИСАТЬ ЭТОТ ОТВРАТИТЕЛЬНЫЙ КОСТЫЛЬ!
-//            UsersToTalks = UsersToTalks - user_name
-//    }
-//}
