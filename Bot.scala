@@ -1,7 +1,6 @@
-import JetBot._
 import akka.actor._
-
 import scala.collection.mutable
+
 
 case class User(id: String, name: String) {
 }
@@ -10,10 +9,16 @@ case class Token(id: String) {
 }
 
 sealed trait Message
-case class TextMessage(text: String, destination: User) extends Message
-case class TalkStarted() extends Message
-case class TalkEnded() extends Message
 
+case class TextMessage(text: String, destination: User) extends Message {
+    def unapply(pattern: String): Unit = {
+        pattern == text
+    }
+}
+
+case class TalkStarted() extends Message
+
+case class TalkEnded() extends Message
 
 
 case class TestMessage(text: String, sender: User)
@@ -21,72 +26,72 @@ case class TestMessage(text: String, sender: User)
 package object JetBot {
     type HandlerType = List[Action]
     type Action = (TextMessage) => (Talk) => Any
-    type HandlersTableType = collection.mutable.Map[State, HandlerType]
-
-    def say(text: String) : (Talk => Any) = {
-        (talk : Talk) => talk.say(text)
-    }
-
-    def moveTo(state: State) : (Talk => Any) = {
-        (talk : Talk) =>  talk.changeState(state)
-    }
-
-    implicit def stringToState(stateName: String) : State = {
-        State(stateName)
-    }
 }
 
-class Talk(user: User, StatesToHandlers : collection.mutable.Map[State, HandlerType]) extends Actor {
+class Talk(user: User, StatesToHandlers: collection.mutable.Map[String, State]) extends Actor {
 
-    var currentState : State = State("TalkStarted")
+    var currentState: String = "State1"
 
-    def say (text: String): Unit = {
-//        BotManager ! Message(text, user)
+    def say(text: String): Unit = {
+        //        BotManager ! Message(text, user)
         Console.println(text)
     }
 
-    def changeState (newState: State) = {
+    def moveTo(newState: String) = {
         currentState = newState
     }
 
     def receive = {
-        case msg : TextMessage =>
-            StatesToHandlers(currentState).foreach(
-                (action : Action) => action(msg)(this)
-            )
+        case msg: TextMessage =>
+            StatesToHandlers(currentState).unboundHandler.boundToTalk(this)
+            StatesToHandlers(currentState).unboundHandler.handler(msg)
     }
 }
 
+trait UnboundHandler {
+    var talk: Talk = null
 
-class StateHandlerChanger(statesToHandlers: HandlersTableType, changingState: State) {
-    def use (handler: HandlerType) = {
-        statesToHandlers(changingState) = handler
+    def handler(msg: TextMessage): Unit
+
+    def boundToTalk(t: Talk) = {
+        talk = t
+    }
+
+    def say(text: String): Unit = {
+        talk.say(text)
+    }
+
+    def moveTo(newState: String) = {
+        talk.moveTo(newState)
     }
 }
 
-case class State(stateName: String)
+object State {
+    def apply(stateName : String)(ub : UnboundHandler): State = {
+        new State(stateName)(ub)
+    }
+}
+class State(val stateName: String)(val unboundHandler: UnboundHandler) {
+
+}
 
 class Bot(token: Token, name: String)(system: ActorSystem) {
     private val usersToTalks: collection.mutable.Map[User, ActorRef] = collection.mutable.Map()
-    val statesToHandlers: collection.mutable.Map[State, HandlerType] =
-        collection.mutable.Map(
-            (State("TalkStarted"), List ((msg : Message) => (talk: Talk) => sys.error("State handler not implemented!"))),
-            (State("TalkEnded"), List ( (msg : Message) => (talk: Talk) => sys.error("State handler not implemented!")))
-        )
+    val statesList = mutable.Map[String, State]()
 
-    val botActor = system.actorOf(BotActor.props(), name)
+    var botActor: ActorRef = null
 
-
-    def addState(state: State) : Unit = {
-        statesToHandlers += state -> List((msg : Message) => (talk: Talk) => sys.error("Not implemented"))
-    }
-
-    def when(state: State) : StateHandlerChanger = {
-        new StateHandlerChanger(statesToHandlers, state)
+    def +(newState: State): Bot = {
+        statesList += (newState.stateName -> newState)
+        this
     }
 
     object BotActor {
         def props(): Props = Props(new BotActor())
+    }
+
+    def launch(): Unit = {
+        botActor = system.actorOf(BotActor.props(), name)
     }
 
     class BotActor extends Actor {
@@ -95,87 +100,86 @@ class Bot(token: Token, name: String)(system: ActorSystem) {
                 usersToTalks.get(sender) match {
                     case Some(talk) => talk ! TextMessage(text, sender)
                     case None =>
-                        val newTalk = context.actorOf(Props(classOf[Talk], sender, statesToHandlers), "talk-with-%s".format(sender.id))
+                        val newTalk = context.actorOf(Props(classOf[Talk], sender, statesList), "talk-with-%s".format(sender.id))
                         usersToTalks += sender -> newTalk
-                        newTalk ! TextMessage("TalkStarted", sender)
+                        //                        newTalk ! TextMessage("TalkStarted", sender)
                         newTalk ! TextMessage(text, sender)
                 }
         }
     }
+
 }
 
+class Desugarizer {
+    val fieldsToInt: collection.mutable.Map[String, String] = collection.mutable.Map()
+
+    def collectDefinitions(text: String): Unit = {
+        val pattern = """(.*)storesState(\s)*\[(\w*)](\s)*\((\s)*\"(\s)*(\w*)""".r
+        (pattern findAllIn text).matchData.toList foreach {
+            case m =>
+                val fieldType = m.group(3)
+                val fieldName = m.group(7)
+                fieldsToInt += (fieldName -> fieldType)
+        }
+    }
+
+}
+
+class Test {
+    def foo[T](name: String, value: T) :Unit = {
+        println(name)
+    }
+}
 
 object main extends App {
-    test()
 
-    def test() : Any = {
-        implicit val system = ActorSystem("TestBot")
-        val token = Token("Sometokentodo")
-        val myBot = new Bot(token, "bot1")(system)
+    import scala.reflect.runtime.universe._
+    val t = new Test()
 
-        myBot addState "Echoing"
 
-        myBot when "TalkStarted" use List(
-            (message : TextMessage) => say("Hello, I'll echo everything you write until you say \"Good bye\""),
-            (message : TextMessage) => moveTo("Echoing")
-        )
+    println(showRaw(reify[Unit](t.foo[Int]("int_field", 0))))
 
-//        // works fine, cause it's easy
-//        myBot when "Echoing" use List(
-//            (message : TextMessage) => say(message.text)
-//        )
+    def test(): Any = {
+        val startState = State("State1")(new UnboundHandler {
+            override def handler(msg: TextMessage) = {
+                msg.text match {
+                    case "hello" => {
+                        say("hello!")
+                        moveTo("State2")
+                    }
+                    case other => {
+                        say("You should greet me first, human.")
+                    }
+                }
+            }
+        })
 
-//        // works incorrect
-//        myBot when "Echoing" use List(
-//            (message : TextMessage) =>
-//                if (message.text == "Goodbye") {
-//                    say("Goodbye, that was pleasure to echo with you :) ")
-//                    moveTo("TalkEnded")
-//                }
-//                else {
-//                    say(message.text)
-//                }
-//        )
-
-        // works correct, but has terrible syntax
-        myBot when "Echoing" use List (
-            (message : TextMessage) => if (message.text == "Goodbye")
-                    say("Goodbye, that was pleasure to echo with you :) ")
+        val anotherState = State("State2")(new UnboundHandler {
+            override def handler(msg: TextMessage) = {
+                if (msg.text == "bye") {
+                    say("bye")
+                    moveTo("State3")
+                }
                 else
-                    say(message.text),
-            (message : TextMessage) =>
-                if (message.text == "Goodbye")
-                    moveTo("TalkEnded")
-                else
-                    moveTo("Echoing")
+                    say(msg.text)
+            }
+        })
 
-        )
+        val finishState = State("State3")(new UnboundHandler {
+            override def handler(msg: TextMessage) = {
+                say("I don't want to talk with you anymore")
+            }
+        })
+        val s : String = ""
+        val system = ActorSystem("TestBot")
+        val myBot = new Bot(Token("123"), "myBot")(system)
 
-        /* Проблемы, имеющиеся на данный момент:
-         * 1. Как красиво предоставлять пользователям доступ к сообщению?
-         * 2. Как предоставить возможность исполнять любую последовательность операторов?
-         * 3. Как убрать лишние синтаксические нагромождения типа List (...), скобочек и прочего
-         *
-         * Возможные решения:
-         * 1. Предоставить пользователям стого ограниченный набор функций, которые сами будут разруливать все что угодно.
-         *    Негибко!
-         * 2. Отделить переход между состояниями от вызова сайдэффекта. Cинтаксис типа:
-         *      when State moveTo State' yielding SideEffect
-         *    Будет велосипед FSM эрланга (и, как следствие, акки)
-         * 3. Сказать, чтобы пользователь сам писал PartialFunction[Any, Unit] в receive -- придется выдать ему
-         *    набор типовых сообщений, а дальше пусть он сам их разворачивает и че хочет вообще делает.
-         *
-         * Выглядит пока что так, что велосипед выигрывает (большое преимущество -- позволяем хранить некоторую информацию Data,
-         * и при этом абстрагируемся от деталей реализации класса)
-         */
-        myBot when "TalkEnded" use List(
-            (message : TextMessage) => say("Goodbye, that was pleasure to echo with you :) ")
-        )
+        myBot + startState + anotherState + finishState
+        myBot.launch()
 
-        val sender = User("id123", "Boss")
-        while(true) {
-            val messageToSend = io.StdIn.readLine()
-            myBot.botActor ! TestMessage(messageToSend, sender)
-        }
+        val d = new Desugarizer()
+        val lines = io.Source.fromFile("""./src/main/resources/test""").mkString
+        d.collectDefinitions(lines)
+        println(d.fieldsToInt)
     }
 }
